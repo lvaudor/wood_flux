@@ -1,0 +1,492 @@
+---
+title: "Wood flux"
+output: html_document
+---
+
+# Libraries and data wrangling
+
+```{r load_packages,message=FALSE,warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+library(readr)
+library(readxl)
+library(randomForest)
+library(lubridate)
+library(tidyverse)
+library(patchwork)
+```
+
+## Prepare wood occurrence data
+
+Read and combine files regarding wood pieces.
+
+Wood data = object **Wdata**.
+
+Each line of Wdata corresponds to **a wood piece occurrence**.
+
+```{r read_data, message=FALSE, warning=FALSE}
+# list all files
+event_dir <- paste0("data/wood_data/",
+                    list.files("data/wood_data/"))
+# add variable "event" and create one single tibble with all events
+my_read=function(file){
+  if(stringr::str_sub(file,-5)==".xlsx"){
+    result=readxl::read_excel(file) %>% 
+      select(Time)}
+  if(stringr::str_sub(file,-4)==".txt"){
+    result=readr::read_table2(file,skip=1) %>%
+      mutate(Time=paste0(lubridate::dmy(Date)," ", as.character(Time))) %>% 
+      mutate(Time=lubridate::ymd_hms(Time)) %>% 
+      select(Time)
+  }
+  return(result)
+}
+Wdata=tibble(event= paste0("event_",1:length(event_dir)),
+             event_dir=event_dir,
+             provider=c(rep("Bruce",3), rep("Zhang",4)),
+             wood_file=event_dir %>% map(list.files)) %>% 
+  unnest() %>% 
+  mutate(wood_file=paste0(event_dir,"/",wood_file)) %>% 
+  mutate(data= map(wood_file,my_read))%>% 
+  unnest() %>% 
+  select(-event_dir) %>% 
+  mutate(Day=date(Time))
+```
+$W$: waiting time between two consecutive wood pieces
+
+When this time is >10h, we remove it from the data as it is due to nighttime preventing the observation of wood occurrence. In case there were several pieces of wood (*npieces*) on a single image, I considered that the waiting time between these pieces was equal to *1 second/npieces*. 
+
+```{r get_WF_in_Wdata,echo=TRUE, message=FALSE, warning=FALSE}
+Wdata <- Wdata %>% 
+  arrange(Time) %>% 
+  mutate(Thour=floor_date(Time,unit="hour")) %>% 
+  mutate(W=difftime(Time,lag(Time,1), units="secs") %>% as.numeric())%>% 
+  group_by(Time) %>% 
+  mutate(npieces=n()) %>% 
+  ungroup() %>% 
+  mutate(W=case_when(npieces<=1~W,
+                     npieces>1~1/npieces)) %>% 
+  mutate(Wpb=case_when(
+    W >= (10*60*60) & provider=="Zhang" ~ 1,     # more than 10h
+    W <  (10*60*60) & provider=="Zhang" ~ 0,    # less than 10h
+    W >= (20*60) & provider=="Bruce" ~ 1,    # more than 20 minutes for Bruce's data
+    W < (20*60) & provider=="Bruce" ~ 0)) %>% 
+  filter(Wpb==0) %>% 
+  # Very low waiting times actually correspond to 
+  # the limitation in time resolution.
+  mutate(Y=log(3600/W)) %>%  
+  na.omit()
+```
+
+$Y=ln(\frac{3600}{W})$
+
+Multiplying by 3600 makes $\frac{3600}{W}$ have a dimension $hour{^-1}$.
+
+
+
+## Prepare discharge data
+
+Discharge data = object **Qdata** and file **Qdata.csv**.
+
+Each line of this table corresponds to **a point in time** for which discharge was measured. Contrary to Wdata, each of these lines does not necessarily correspond to a registered occurrence of wood. 
+
+To build Qdata, I downloaded QTVAR datafiles (with precision 1%) from **banque hydro**, ranging from 01/01/2000 to 31/12/2013. 
+
+I calculated the variable $T_Q$ at time t, which corresponds to **the time elapsed since last time Q was at the same value as observed at t**. 
+
+I also calculated the variable $S$ which corresponds to the **difference in discharge on a small timelag (5 minutes)**.
+
+$$S=Q_{time}-Q_{time-5min}$$
+```{r calculate_Qdata}
+if(!file.exists("data/Qdata.csv")){
+    Qfiles=paste0("data/discharge_data/qtvar",2000:2013,".csv")
+    # We're going to calculate Qdata, the datatable related to discharge:
+    Qdata=Qfiles %>% 
+      # Read all discharge files (yearly files):
+      map(~read_delim(., 
+                      ";", 
+                      escape_double = FALSE,
+                      trim_ws = TRUE,
+                      skip = 10,
+                      locale = locale(decimal_mark = ",",
+                                      encoding = "ISO-8859-1"))) %>% 
+      # bind them together:
+      bind_rows() %>% 
+      # change names of variables to Time and Q:
+      select(Time=Date,  
+             Q=`Q (m3/s)`) %>% 
+      # define how Time is formatted:
+      mutate(Time=dmy_hm(Time)) %>% 
+      # create void variable T_Q:
+      mutate(T_Q=NA) 
+    # We're going to fill T_Q through a loop
+    # For any point in time (i-th row of Qdata)
+    for (i in 10000:nrow(Qdata)){ 
+      # myQ is current value of Q.
+      myQ=Qdata$Q[i] 
+      # For all previous points in time,
+      s=sign(myQ-Qdata$Q[1:(i-1)]) 
+      # which are the ones that correspond to a higher discharge? 
+      ind=which(s<0)  
+      # And which of these is the latest one?
+      ind=ind[length(ind)] 
+      # Let's consider this point in time and the one right afterwards
+      ind=ind:(ind+1) 
+      # If there's a difference in discharge between these two points
+      if(diff(Qdata$Q[ind])!=0){ 
+        # then we're gonna interpolate the exact time when: 
+        # Q was exactly equal to myQ
+        time=as.POSIXct(approx(x=Qdata$Q[ind],
+                               y=as.numeric(Qdata$Time[ind],
+                                            origin="1970-01-01 00:00:00"),
+                               xout=myQ)$y,
+                        origin="1970-01-01 00:00:00")
+      }else{
+        # else we just take that first point in time
+        time=mean(Qdata$Time[ind]) 
+      }
+      Qdata$T_Q[i]=difftime(Qdata$Time[i],time,units="days")
+      # T_Q at point i in time is equal to the difference (in days) between
+      # a) time at point i and b) time when such a discharge was last seen
+    }
+    #######
+    # Remove the first lines of discharge data, for which we don't 
+    # go back enough in time to calculate T_Q
+    Qdata <- na.omit(Qdata) 
+    Qdata <- Qdata %>% 
+      mutate(Time=ymd_hms(Time),
+             S=Q-approx(Qdata$Time,Qdata$Q,xout=Qdata$Time-60*5)$y) 
+    # S is the difference between Q(time i) and Q(time i-5 minutes)
+    readr::write_csv(Qdata, "data/Qdata.csv")
+}
+
+# Read Qdata and keep only relevant days
+Qdata=readr::read_csv("data/Qdata.csv") %>% 
+  mutate(Day=date(Time)) %>% 
+  left_join(select(Wdata, Day, event) %>% unique(),by="Day") %>% 
+  na.omit()
+
+# Interpolate Qdata to have Q, T_Q, S every hour of the events
+Qdata=tibble(Time=seq(floor_date(min(Qdata$Time), unit="hour"),
+                      ceiling_date(max(Qdata$Time), unit="hour"),
+                      by="1 hour")) %>% 
+   mutate(Day=date(Time)) %>%
+   left_join(select(Wdata, Day, event) %>% unique(),by="Day") %>% 
+   mutate(Q=approx(Qdata$Time,Qdata$Q,xout=Time)$y,
+          T_Q=approx(Qdata$Time,Qdata$T_Q,xout=Time)$y,
+          S=approx(Qdata$Time,Qdata$S,xout=Time)$y) %>% 
+   mutate(rT_Q=sqrt(T_Q)) %>% 
+   na.omit()
+```
+
+
+Qdata hence contains the variables
+
+- Q
+- S
+- T_Q
+- rT_Q ($\sqrt {T_Q}$)
+
+These are interpolated to obtain **discharge data every hour** of the events.
+
+## Complete wood occurrence data with discharge descriptors
+
+**Discharge data (variables Q, S, T_Q, rT_Q) is joined to wood occurrence data (Wdata)**:
+
+```{r approx_Qdata}
+Wdata <- Wdata %>% 
+  mutate(Q=approx(Qdata$Time,Qdata$Q,xout=Wdata$Time)$y,
+         T_Q=approx(Qdata$Time,Qdata$T_Q,xout=Wdata$Time)$y,
+         S=Q-approx(Qdata$Time,Qdata$Q,xout=Wdata$Time-5*60)$y) %>% 
+  filter(!is.na(Time))%>% 
+  mutate(rT_Q=sqrt(T_Q))
+```
+
+## Prepare graphics and calculations
+
+We create table `NightTime` to help **represent night times as dark-grey background polygons** on the time series plots:
+
+```{r create_NightTime}
+events=unique(Wdata$event)
+NightTime=tibble(event=Wdata$event,
+                 Day=Wdata$Day) %>%
+  unique() %>% 
+  mutate(night=ymd_hms(paste0(Day-days(1)," 18:00:00")),
+         day  =ymd_hms(paste0(Day," 6:00:00"))) 
+```
+
+We pre-define **breaks and labels for logarithmic axes**:
+
+```{r prepare_axes}
+labels=c(1,rep("",8),
+        10,rep("",8),
+        100,rep("",8),
+        1000,rep("",8),
+        10000,rep("",9))
+breaks=c(seq(1,10,by=1),
+        seq(20,100,by=10),
+        seq(200,1000,by=100),
+        seq(2000,10000,by=1000),
+        seq(20000,100000,by=10000))
+```
+
+Define **function that will calculate R2**:
+
+```{r define_calc_R2}
+calc_R2 <- function(mydata,pred,obs){
+  qpred=enquo(pred)
+  qobs=enquo(obs)
+  mydata <- mydata %>%
+    mutate(predicted=!!qpred,
+           observed=!!qobs) %>% 
+    select(predicted,observed) %>% 
+    na.omit() %>% 
+    mutate(diff=observed-predicted)
+  num=var(mydata$diff)
+  denom=var(mydata$observed)
+  result=round(1-num/denom,2)
+  return(result)
+}
+```
+
+# RandomForest: Y as a function of Q, S, rT_Q
+
+## Fitting of the Random Forest
+
+Fit of a random forest with **Y** as response and predictors **Q**, **rT_Q** and **S**.
+
+```{r rf, cache=TRUE}
+# run_rf is the function that runs the random forest. 
+run_rf=function(Wdata){
+  Wdata_rf <- Wdata %>% 
+    select(Q,
+           rT_Q,
+           S,
+           Y) %>% 
+    na.omit()
+  myrf=randomForest(Y~.,data=Wdata_rf)
+  return(myrf)
+}
+myrf <- run_rf(Wdata)
+```
+
+## Cross-validation
+
+```{r try_cross_validation}
+Wdata_cv=Wdata %>% 
+  mutate(part=ifelse(runif(nrow(Wdata))>=0.8,"test","train"))
+rf_train=run_rf(Wdata_cv %>% filter(part=="train"))
+Wdata_cv= Wdata_cv %>% 
+  mutate(Ypred=predict(rf_train,.))
+```
+
+The random forest converges rapidly (500 trees is enough):
+
+```{r plot_rf_convergence, fig.width=5, fig.height=3}
+plot(myrf)
+```
+
+## Variables importance and effect
+
+Relative importance of predictors in the prediction of response:
+
+```{r variables_importance}
+impdat=importance(myrf) %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column() %>% 
+  arrange(desc(IncNodePurity)) %>% 
+  mutate(prop=paste0(round(IncNodePurity/sum(IncNodePurity),2)*100,"%"))
+impdat
+```
+
+Result of calls to function partialPlot: depicts marginal effect of a variable on response. Reference: Friedman, J. (2001). Greedy function approximation: the gradient boosting machine, Ann. of Stat.
+
+```{r variables_effect, fig.width=5,fig.height=3, dev=c("png","svg")}
+pdata=vector(length=3,mode="list")
+for (i in 1:3){
+  varname=impdat$rowname[i]
+  pdata[[i]]=partialPlot(myrf,
+                    pred.data=as.data.frame(Wdata %>%
+                                              select(rT_Q,Q,S)),
+                    impdat$rowname[i],
+                    plot=FALSE) %>%
+    as_tibble()
+  if(varname=="rT_Q"){
+    pdata[[i]]=mutate(pdata[[i]],x=x^2)
+  }
+} 
+
+varnames = c("T_Q","Q","S")
+for (i in 1:3){
+  Wp=Wdata %>% mutate_(x=varnames[i]) %>% mutate(y=exp(Y))
+  p=ggplot(Wp,
+           aes(x=x,y=y))+
+    geom_point(alpha=0.1)+
+    geom_line(data=pdata[[i]],aes(x=x,y=exp(y)), col="red", lwd=2)+
+    xlab(varnames[i])+
+    ylab("Y")+
+    scale_y_continuous(trans="log",
+                       breaks=breaks,
+                       labels=labels)+
+    theme_bw()
+  if(varnames[i]=="S"){p=p+geom_vline(xintercept=0,linetype=3)}
+  print(p)
+}
+```
+
+
+
+```{r variables_effect_quantiles, fig.width=5,fig.height=3, dev=c("png","svg")}
+varnames = c("T_Q","Q","S")
+for (i in 1:3){
+  Wp=Wdata %>%
+    mutate_(x=varnames[i]) %>%
+    mutate(y=exp(Y))
+  if(i==1){Wp=Wp %>% 
+    mutate(x=sqrt(x))} 
+  tibq=tibble(q=unique(quantile(Wp$x,
+                                seq(0,1,by=0.2)))) %>% 
+    mutate(x1=q,
+           x2=lead(q,1)) %>% 
+    mutate(qid=rank(q,ties.method="first")) 
+  tibql=tibq %>%
+    na.omit() %>% 
+    tidyr::pivot_longer(cols=starts_with("x")) 
+  Wpsum=Wp %>%
+    mutate(qid=as.numeric(cut(x,tibq$q,
+                 include.lowest=TRUE))) %>% 
+    group_by(qid) %>% 
+    summarise(y0.1=quantile(y,0.1),
+              y0.25=quantile(y,0.25),
+              y0.5=quantile(y,0.5),
+              y0.75=quantile(y,0.75),
+              y0.9=quantile(y,0.9)) %>% 
+    ungroup() %>% 
+    left_join(tibql, by="qid") %>% 
+    mutate(x=value) 
+  if(i==1){Wpsum=Wpsum %>% 
+    mutate(x=x^2)}
+  p=ggplot(Wp,
+           aes(x=x,y=y))+
+    geom_line(data=Wpsum, aes(x=x,y=y0.1),col="dark grey", linetype=2)+
+    geom_line(data=Wpsum, aes(x=x,y=y0.9),col="dark grey", linetype=2)+
+    geom_line(data=Wpsum, aes(x=x,y=y0.25),col="dark grey")+
+    geom_line(data=Wpsum, aes(x=x,y=y0.75),col="dark grey")+
+    geom_line(data=Wpsum, aes(x=x,y=y0.5),col="blue")+
+    geom_line(data=pdata[[i]],aes(x=x,y=exp(y)), col="red", lwd=2)+
+    xlab(varnames[i])+
+    ylab("Y")+
+    scale_y_continuous(trans="log",
+                       breaks=breaks,
+                       labels=labels)+
+    theme_bw()
+  if(varnames[i]=="S"){p=p+geom_vline(xintercept=0,linetype=3)}
+  print(p)
+}
+```
+
+## Get predictions of the Random Forest
+
+Predict values for Wdata and Qdata.
+
+```{r get_rf_predictions}
+Wdata <- Wdata %>% 
+  mutate(Ypred=predict(myrf,.))
+Qdata <- Qdata %>% 
+  mutate(Ypred=predict(myrf,.))
+```
+
+## Plot of Predictions & Observations = f(time)
+
+Here we plot vs time:
+
+- **observations** (in green)
+- **predictions** (in red, solid line)
+
+### Raw observations
+
+```{r plot_Wdata_obs_and_pred, warning=FALSE, message=FALSE, fig.width=6, fig.height=9}
+ggplot(NightTime, aes(x=day,y=1))+
+ # prediction: red line
+ geom_step(data=Qdata,aes(x=Time, y=exp(Ypred)),color="red")+
+ geom_point(data=Wdata,
+            aes(x=Time, y=exp(Y)),
+            color="forestgreen",alpha=0.01)+
+ facet_wrap(~event, scale="free", nrow=length(events))+
+ geom_rect(aes(xmin=night,xmax=day,ymin=0,ymax=+Inf),
+            fill="navy",alpha=0.1)+
+ scale_y_log10()+
+ scale_x_datetime(date_labels =  "%d", date_breaks="1 day") 
+```
+
+### Hourly summaries of observations and predictions=f(time)
+
+Here we **summarise the data by hour**, and show the wood flux per hour (number of wood pieces per hour):
+
+- predicted value $n_{pred}$ (in red) 
+- observed value $n_{obs}$. 
+
+Both values are **corrected** to take into account the **actual observation time per hour**.
+
+```{r Wdatasum_calc}
+Wdatasum=Wdata %>%
+      mutate(Time=Thour) %>% 
+      group_by(event, Day, Time) %>% 
+      summarise(Nraw=n(),
+                sW=sum(W))%>% 
+      mutate(N=Nraw*(3600/sW)) %>% 
+      ungroup() %>% 
+      na.omit() %>% 
+      ungroup() 
+```
+
+We have modelled $Y=log(\frac{3600}{W})$.
+
+Considering that $Y$ has a roughly symetrical distribution, we can consider that :
+
+$median(Y)=mean(Y)$
+
+And $Y=log(\frac{3600}{W})$ so $W=\frac{3600}{exp(Y)} $
+
+Hence $median(W)=\frac{3600}{exp(median(Y))}$
+
+Considering that W is a waiting time without memory process we can consider that it follows an exponential distribution. Hence
+
+$mean(W)=\frac{median(W)}{ln(2)}$
+
+```{r plot_Wdatasum_obs_and_pred, fig.height=9, fig.width=6, message=FALSE, warning=FALSE}
+Qdata=Qdata %>% 
+    mutate(Wpred=3600/exp(Ypred)) %>% 
+    mutate(Wpred=Wpred/log(2)) %>% 
+    mutate(Npred=3600/Wpred) %>% 
+  left_join(Wdatasum %>% select(Time,N),by="Time") %>% 
+    mutate(Y=log(N))
+ggplot(NightTime, aes(x=day,y=1))+
+  # prediction: red line
+  geom_step(data=Qdata,stat="identity",aes(x=Time, y=Npred),fill="red", alpha=0.5, col="red")+
+  scale_y_continuous(trans="log")+
+  facet_wrap(event~., scales="free_x",nrow=length(events))+
+  geom_point(data=Wdatasum,aes(x=Time,y=N), col="forestgreen")+
+  geom_rect(aes(xmin=night,xmax=day,ymin=0,ymax=+Inf),
+            fill="navy",alpha=0.1)+
+  scale_y_log10()+
+  scale_x_datetime(date_labels =  "%d", date_breaks="1 day") 
+```
+
+
+## Models' predictive performances
+
+R$^2$ is calculated on the relationship between Y and Ypred.
+
+It is either calculated on piece-by-piece data (Wdata) or data aggregated for 1 hour (Qdata).
+
+
+### Global R2 (all events considered) :
+
+```{r global_R2}
+tibble_R2=tibble(
+  R2_piecewise=calc_R2(Wdata,Ypred,Y),
+  R2_hourly=calc_R2(Qdata,Ypred,Y)
+  )
+knitr::kable(tibble_R2)
+```
+
