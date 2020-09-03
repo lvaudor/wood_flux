@@ -228,26 +228,6 @@ breaks=c(seq(1,10,by=1),
         seq(2000,10000,by=1000),
         seq(20000,100000,by=10000))
 ```
-
-Define **function that will calculate R2**:
-
-```{r define_calc_R2}
-calc_R2 <- function(mydata,pred,obs){
-  qpred=enquo(pred)
-  qobs=enquo(obs)
-  mydata <- mydata %>%
-    mutate(predicted=!!qpred,
-           observed=!!qobs) %>% 
-    select(predicted,observed) %>% 
-    na.omit() %>% 
-    mutate(diff=observed-predicted)
-  num=var(mydata$diff)
-  denom=var(mydata$observed)
-  result=round(1-num/denom,2)
-  return(result)
-}
-```
-
 # RandomForest: Y as a function of Q, S, rT_Q
 
 ## Fitting of the Random Forest
@@ -255,31 +235,36 @@ calc_R2 <- function(mydata,pred,obs){
 Fit of a random forest with **Y** as response and predictors **Q**, **rT_Q** and **S**.
 
 ```{r rf, cache=TRUE}
-# run_rf is the function that runs the random forest. 
-run_rf=function(Wdata){
-  Wdata_rf <- Wdata %>% 
+set.seed(33)
+Wdata_rf <- Wdata %>% 
     select(Q,
            rT_Q,
            S,
            Y) %>% 
     na.omit()
-  myrf=randomForest(Y~.,data=Wdata_rf)
-  return(myrf)
-}
-myrf <- run_rf(Wdata)
+myrf=randomForest(Y~., data=Wdata_rf)
+myrf
 ```
 
 ## Cross-validation
 
 ```{r try_cross_validation}
+set.seed(33)
 Wdata_cv=Wdata %>% 
   mutate(part=ifelse(runif(nrow(Wdata))>=0.8,"test","train"))
-rf_train=run_rf(Wdata_cv %>% filter(part=="train"))
-Wdata_cv= Wdata_cv %>% 
-  mutate(Ypred=predict(rf_train,.))
+xtest=Wdata_cv %>% filter(part=="test") %>% select(Q,rT_Q,S) %>% as.data.frame()
+ytest=Wdata_cv %>% filter(part=="test") %>% select(Y) %>% pull()
+Wdata_cv <- Wdata_cv %>% 
+    select(Q,
+           rT_Q,
+           S,
+           Y) %>% 
+    na.omit()
+rf_cv=randomForest(Y~., data=Wdata_cv, xtest=xtest,ytest=ytest)
+rf_cv
 ```
 
-The random forest converges rapidly (500 trees is enough):
+The random forest converges rapidly (so that the default value of 500 trees is enough):
 
 ```{r plot_rf_convergence, fig.width=5, fig.height=3}
 plot(myrf)
@@ -471,22 +456,3 @@ ggplot(NightTime, aes(x=day,y=1))+
   scale_y_log10()+
   scale_x_datetime(date_labels =  "%d", date_breaks="1 day") 
 ```
-
-
-## Models' predictive performances
-
-R$^2$ is calculated on the relationship between Y and Ypred.
-
-It is either calculated on piece-by-piece data (Wdata) or data aggregated for 1 hour (Qdata).
-
-
-### Global R2 (all events considered) :
-
-```{r global_R2}
-tibble_R2=tibble(
-  R2_piecewise=calc_R2(Wdata,Ypred,Y),
-  R2_hourly=calc_R2(Qdata,Ypred,Y)
-  )
-knitr::kable(tibble_R2)
-```
-
